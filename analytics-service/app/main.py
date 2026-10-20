@@ -22,15 +22,27 @@ from app.services.visualization import VALID_CHART_TYPES, generate_chart
 from app.services.result_serializer import serialize_analytics_result
 from app.services.ipfs_uploader import upload_result_to_ipfs
 from app.services.chain_registry import register_on_chain, get_analytics_for_dataset
+from app.services.audit_logger import AuditLogger
 from app.services.inferential import (
     run_two_group_test,
     run_paired_test,
     run_one_sample_test,
     run_multi_group_test,
+    run_chi_square_independence,
+    run_chi_square_goodness_of_fit,
+    run_pearson_correlation,
+    run_spearman_correlation,
+    run_correlation_analysis,
+    run_correlation_matrix,
 )
 from app.utils.csv_parser import parse_csv
 
+# Demo: Hypothesis Lab prototype
+from app.routers.demo_router import router as demo_router
+from app.services.demo_sessions import session_store
+
 APP_VERSION = "0.1.0"
+audit_logger = AuditLogger(log_path="audit_log.json")
 
 app = FastAPI(
     title="Bio-Block Analytics API",
@@ -39,11 +51,24 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=["http://localhost:3000", "http://localhost:5174"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Mount the hypothesis-tree demo router
+app.include_router(demo_router)
+
+
+@app.on_event("startup")
+async def startup_event():
+    await session_store.start_cleanup_loop()
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    await session_store.stop_cleanup_loop()
 
 
 @app.get("/health", response_model=HealthResponse)
@@ -100,6 +125,13 @@ async def descriptive_analysis(
                 analysis_type="descriptive",
                 analyst_address=auth.wallet_address,
             )
+
+    audit_logger.log_operation(
+        operation="DESCRIBE",
+        wallet_address=auth.wallet_address,
+        dataset_cid=auth.dataset_cid,
+        details=f"cols={analysis['columns_analyzed']}, rows={len(df)}",
+    )
 
     return DescriptiveResponse(
         source_dataset_cid=auth.dataset_cid,
@@ -211,6 +243,13 @@ async def visualize(
                 analyst_address=auth.wallet_address,
             )
 
+    audit_logger.log_operation(
+        operation="VISUALIZE",
+        wallet_address=auth.wallet_address,
+        dataset_cid=auth.dataset_cid,
+        details=f"chart={chart_type}, rows={len(df)}",
+    )
+
     return VisualizationResponse(
         source_dataset_cid=auth.dataset_cid,
         chart_type=chart_type,
@@ -225,6 +264,8 @@ async def visualize(
 VALID_TEST_TYPES = {
     "t_test": ["independent", "paired", "one_sample"],
     "anova": ["one_way", "two_way", "repeated_measures"],
+    "chi_square": ["independence", "goodness_of_fit"],
+    "correlation": ["pearson", "spearman", "auto", "matrix"],
 }
 VALID_ALTERNATIVES = ["two-sided", "less", "greater"]
 
@@ -235,13 +276,15 @@ async def inferential_analysis(
     file: UploadFile = File(...),
     test_type: str = Form(
         ...,
-        description="Test category: t_test, anova",
+        description="Test category: t_test, anova, chi_square, correlation",
     ),
     test_subtype: Optional[str] = Form(
         None,
         description=(
             "Test subtype. For t_test: independent, paired, one_sample. "
-            "For anova: one_way, two_way, repeated_measures."
+            "For anova: one_way, two_way, repeated_measures. "
+            "For chi_square: independence, goodness_of_fit. "
+            "For correlation: pearson, spearman, auto, matrix."
         ),
     ),
     numeric_column: Optional[str] = Form(
@@ -265,6 +308,22 @@ async def inferential_analysis(
     repeated_columns: Optional[str] = Form(
         None,
         description="Comma-separated condition columns (for repeated measures)",
+    ),
+    column_1: Optional[str] = Form(
+        None,
+        description="First column (for chi-square independence or correlation)",
+    ),
+    column_2: Optional[str] = Form(
+        None,
+        description="Second column (for chi-square independence or correlation)",
+    ),
+    target_columns: Optional[str] = Form(
+        None,
+        description="Comma-separated columns (for correlation matrix)",
+    ),
+    correlation_method: Optional[str] = Form(
+        "auto",
+        description="Correlation method: pearson, spearman, auto",
     ),
     alpha: float = Form(0.05, description="Significance level"),
     alternative: str = Form(
@@ -307,16 +366,13 @@ async def inferential_analysis(
     cleaned_numeric_2 = _clean(numeric_column_2)
     cleaned_factor_2 = _clean(factor_column_2)
     cleaned_repeated = _clean(repeated_columns)
+    cleaned_col1 = _clean(column_1)
+    cleaned_col2 = _clean(column_2)
+    cleaned_target_cols = _clean(target_columns)
+    cleaned_corr_method = _clean(correlation_method) or "auto"
 
     # Validate test_type
     if cleaned_test_type not in VALID_TEST_TYPES:
-        # Check for not-yet-implemented types with a specific message
-        if cleaned_test_type in ("chi_square", "correlation"):
-            raise HTTPException(
-                400,
-                f"Test type '{cleaned_test_type}' is not yet implemented. "
-                f"Supported types: {list(VALID_TEST_TYPES.keys())}",
-            )
         raise HTTPException(
             400,
             f"Unsupported test type '{cleaned_test_type}'. "
@@ -431,6 +487,71 @@ async def inferential_analysis(
                 raise HTTPException(
                     400, f"Unknown anova subtype: {subtype}"
                 )
+
+        elif cleaned_test_type == "chi_square":
+            subtype = cleaned_subtype or "independence"
+            if subtype == "independence":
+                c1 = cleaned_col1 or cleaned_numeric
+                c2 = cleaned_col2 or cleaned_group
+                if not c1 or not c2:
+                    raise HTTPException(
+                        400,
+                        "Chi-square independence test requires 'column_1' "
+                        "and 'column_2' (or 'numeric_column' and "
+                        "'group_column').",
+                    )
+                analysis = run_chi_square_independence(
+                    df, c1, c2, alpha
+                )
+            elif subtype == "goodness_of_fit":
+                col = cleaned_col1 or cleaned_numeric
+                if not col:
+                    raise HTTPException(
+                        400,
+                        "Chi-square goodness-of-fit requires 'column_1' "
+                        "(or 'numeric_column').",
+                    )
+                analysis = run_chi_square_goodness_of_fit(
+                    df, col, alpha=alpha
+                )
+            else:
+                raise HTTPException(
+                    400, f"Unknown chi_square subtype: {subtype}"
+                )
+
+        elif cleaned_test_type == "correlation":
+            subtype = cleaned_subtype or "auto"
+            if subtype == "matrix":
+                cols_list = None
+                if cleaned_target_cols:
+                    cols_list = [
+                        c.strip() for c in cleaned_target_cols.split(",")
+                        if c.strip()
+                    ]
+                analysis = run_correlation_matrix(
+                    df, columns=cols_list, method=cleaned_corr_method, alpha=alpha
+                )
+            else:
+                c1 = cleaned_col1 or cleaned_numeric
+                c2 = cleaned_col2 or cleaned_group
+                if not c1 or not c2:
+                    raise HTTPException(
+                        400,
+                        "Correlation analysis requires 'column_1' and "
+                        "'column_2' (or 'numeric_column' and "
+                        "'group_column').",
+                    )
+                if subtype == "pearson":
+                    analysis = run_pearson_correlation(df, c1, c2, alpha)
+                elif subtype == "spearman":
+                    analysis = run_spearman_correlation(df, c1, c2, alpha)
+                elif subtype == "auto":
+                    analysis = run_correlation_analysis(df, c1, c2, alpha)
+                else:
+                    raise HTTPException(
+                        400, f"Unknown correlation subtype: {subtype}"
+                    )
+
         else:
             raise HTTPException(400, f"Unknown test type: {cleaned_test_type}")
 
@@ -497,6 +618,13 @@ async def inferential_analysis(
     if tx_hash:
         response["tx_hash"] = tx_hash
 
+    audit_logger.log_operation(
+        operation="INFER",
+        wallet_address=auth.wallet_address,
+        dataset_cid=auth.dataset_cid,
+        details=f"test={cleaned_test_type}/{cleaned_subtype}, rows={len(df)}",
+    )
+
     return response
 
 
@@ -530,6 +658,49 @@ async def get_dataset_results(dataset_cid: str):
     """Query the AnalyticsRegistry contract for all result CIDs linked to a dataset."""
     result_cids = get_analytics_for_dataset(dataset_cid)
     return RegistryDatasetResponse(dataset_cid=dataset_cid, result_cids=result_cids)
+
+
+# -- Audit Logging Phase 2 endpoints --
+
+@app.get("/audit/verify/{entry_id}")
+async def verify_audit_entry(entry_id: str):
+    """SHA-256 hash-chain validation for a single log entry."""
+    result = audit_logger.verify_entry(entry_id)
+    if not result.get("valid") and result.get("reason") == "entry not found":
+        raise HTTPException(404, "Audit entry not found")
+    return result
+
+
+@app.get("/audit/verify")
+async def verify_audit_chain():
+    """Validate the entire hash-chain. Returns first broken link if any."""
+    return audit_logger.verify_chain()
+
+
+@app.get("/audit/logs")
+async def get_audit_logs(
+    wallet_address: Optional[str] = None,
+    operation: Optional[str] = None,
+    dataset_cid: Optional[str] = None,
+    limit: int = 50,
+):
+    logs = audit_logger.query_logs(
+        wallet_address=wallet_address,
+        operation=operation,
+        dataset_cid=dataset_cid,
+        limit=limit,
+    )
+    return {"logs": logs, "total": len(logs)}
+
+
+@app.get("/audit/logs/{entry_id}")
+async def get_audit_entry(entry_id: str):
+    entry = audit_logger.get_entry(entry_id)
+    if not entry:
+        raise HTTPException(404, "Audit entry not found")
+    verification = audit_logger.verify_entry(entry_id)
+    entry["integrity_verified"] = verification["valid"]
+    return entry
 
 
 if __name__ == "__main__":
